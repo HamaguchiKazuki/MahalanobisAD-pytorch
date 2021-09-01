@@ -6,7 +6,9 @@ import pickle
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import roc_curve
+from sklearn.metrics import confusion_matrix
 from sklearn.covariance import LedoitWolf
+from sklearn.manifold import TSNE
 from scipy.spatial.distance import mahalanobis
 import matplotlib.pyplot as plt
 
@@ -30,6 +32,8 @@ def parse_args():
 def main():
 
     args = parse_args()
+
+    dim_reduction_model= TSNE(n_components=2)
 
     # device setup
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -56,6 +60,7 @@ def main():
 
         train_outputs = [[] for _ in range(9)]
         test_outputs = [[] for _ in range(9)]
+        youden_index_thresholds = []
 
         # extract train set features
         train_feat_filepath = os.path.join(
@@ -65,6 +70,7 @@ def main():
                 # model prediction
                 with torch.no_grad():
                     feats = extract_features(x.to(device), model, args.pool_method)
+
                 for f_idx, feat in enumerate(feats):
                     train_outputs[f_idx].append(feat)
 
@@ -94,30 +100,45 @@ def main():
             # model prediction
             with torch.no_grad():
                 feats = extract_features(x.to(device), model, args.pool_method)
+
             for feat_idx, feat in enumerate(feats):
                 test_outputs[feat_idx].append(feat)
+
         for test_idx, test_output in enumerate(test_outputs):
             test_outputs[test_idx] = torch.cat(
                 test_output, 0).squeeze().cpu().detach().numpy()
 
         # calculate Mahalanobis distance per each level of EfficientNet
         dist_list = []
-        for t_idx, test_output in enumerate(test_outputs):
-            mean = train_outputs[t_idx][0]
-            cov_inv = np.linalg.inv(train_outputs[t_idx][1])
+        each_level_dist = {}
+        for test_idx, test_output in enumerate(test_outputs):
+            mean = train_outputs[test_idx][0]
+            cov_inv = np.linalg.inv(train_outputs[test_idx][1])
+            print(f"level, {test_idx}, mean shape, {mean.shape}")
             dist = [mahalanobis(sample, mean, cov_inv)
                     for sample in test_output]
+            each_level_dist[test_idx + 1] = np.array(dist)
             dist_list.append(np.array(dist))
 
         # Anomaly score is followed by unweighted summation of the Mahalanobis distances
-        scores = np.sum(np.array(dist_list), axis=0)
+        # scores = np.sum(np.array(dist_list), axis=0)
+        scores = each_level_dist[7]
 
         # calculate image-level ROC AUC score
-        fpr, tpr, _ = roc_curve(gt_list, scores)
+        fpr, tpr, thresholds = roc_curve(gt_list, scores)
         roc_auc = roc_auc_score(gt_list, scores)
         total_roc_auc.append(roc_auc)
-        print('%s ROCAUC: %.3f' % (class_name, roc_auc))
-        plt.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, roc_auc))
+        youden_index_thresholds.append(thresholds[np.argmax(tpr-fpr)])
+        print(f"{class_name}, youden index, {thresholds[np.argmax(tpr-fpr)]:.1f}")
+        tn, fp, fn, tp = confusion_matrix(
+            gt_list, scores >= thresholds[np.argmax(tpr-fpr)]).flatten()
+        print(
+            f"conf matrix, tn, fp, fn, tp, {tn, fp, fn, tp}")
+        # print('%s ROCAUC: %.3f' % (class_name, roc_auc))
+        # plt.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, roc_auc))
+        print('%s ROCAUC: %.3f, mean th: %.1f' % (class_name, roc_auc, np.mean(youden_index_thresholds)))
+        plt.plot(fpr, tpr, label='%s ROCAUC: %.3f, mean th:%.1f' %
+                 (class_name, roc_auc, np.mean(youden_index_thresholds)))
 
     print('Average ROCAUC: %.3f' % np.mean(total_roc_auc))
     plt.title('Average image ROCAUC: %.3f' % np.mean(total_roc_auc))
